@@ -31,6 +31,7 @@ add_library(${PACKAGE_NAME} SHARED
         ../cpp/HybridTfliteModel.cpp
         ../cpp/HybridTfliteModule.cpp
         ../cpp/TfliteHelpers.cpp
+        ../cpp/TfliteWorker.cpp
 )
 
 # Add Nitrogen specs :)

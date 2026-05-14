@@ -1,5 +1,6 @@
 #include "HybridTfliteModel.hpp"
 #include "TfliteHelpers.hpp"
+#include "TfliteWorker.hpp"
 
 #include <NitroModules/ArrayBuffer.hpp>
 #include <NitroModules/Promise.hpp>
@@ -17,21 +18,40 @@ namespace margelo::nitro::tflite {
 
 HybridTfliteModel::HybridTfliteModel(TfLiteInterpreter* interpreter,
                                      std::shared_ptr<ArrayBuffer> modelData,
-                                     std::vector<TensorflowModelDelegate> delegates)
+                                     std::vector<TensorflowModelDelegate> delegates,
+                                     std::vector<std::function<void()>> delegateDeleters)
     : HybridObject(TAG), _interpreter(interpreter), _delegates(std::move(delegates)),
-      _modelData(modelData) {
-  TfLiteStatus status = TfLiteInterpreterAllocateTensors(_interpreter);
-  if (status != kTfLiteOk) {
-    throw std::runtime_error(
-        "TFLite: Failed to allocate memory for input/output tensors! Status: " +
-        tfLiteStatusToString(status));
-  }
+      _modelData(modelData), _delegateDeleters(std::move(delegateDeleters)) {
+  // The caller (HybridTfliteModule::createModel) is responsible for calling
+  // `TfLiteInterpreterAllocateTensors` on the worker thread before constructing
+  // us. AllocateTensors initializes per-delegate GPU buffers and must run on
+  // the same OS thread that created the delegate (see TfliteWorker.hpp).
 }
 
 HybridTfliteModel::~HybridTfliteModel() {
-  if (_interpreter != nullptr) {
-    TfLiteInterpreterDelete(_interpreter);
-    _interpreter = nullptr;
+  // The destructor runs on whichever thread Hermes' JSI finalizer reaps this
+  // object from — usually NOT the thread that created the GPU delegate. Route
+  // teardown through the worker so create / destroy run on the same OS thread,
+  // satisfying PowerVR's per-thread OpenCL context invariant.
+  TfLiteInterpreter* interpreter = _interpreter;
+  std::vector<std::function<void()>> deleters = std::move(_delegateDeleters);
+  _interpreter = nullptr;
+  if (interpreter == nullptr && deleters.empty()) return;
+
+  try {
+    worker::run([interpreter, deleters = std::move(deleters)]() {
+      if (interpreter != nullptr) {
+        TfLiteInterpreterDelete(interpreter);
+      }
+      // Delete delegates in reverse creation order, after the interpreter.
+      // Each deleter calls the destroy function paired with the delegate at
+      // construction (TfLiteGpuDelegateV2Delete, TfLiteNnapiDelegateDelete, ...)
+      for (auto it = deleters.rbegin(); it != deleters.rend(); ++it) {
+        if (*it) (*it)();
+      }
+    });
+  } catch (...) {
+    // Destructors must not throw.
   }
   // _modelData (shared_ptr<ArrayBuffer>) is automatically freed
 }
@@ -146,21 +166,32 @@ void HybridTfliteModel::invoke() {
 
 std::vector<std::shared_ptr<ArrayBuffer>>
 HybridTfliteModel::runSync(const std::vector<std::shared_ptr<ArrayBuffer>>& input) {
-  copyInputBuffers(input);
-  invoke();
-  return copyOutputBuffers();
+  // Confine the full input-copy → invoke → output-copy pipeline to the worker
+  // thread so all interpreter touches happen on the same OS thread that created
+  // the GPU delegate. worker::run blocks the caller, so the JS-owned input
+  // ArrayBuffers stay alive throughout (no GC race).
+  return worker::run([this, &input]() -> std::vector<std::shared_ptr<ArrayBuffer>> {
+    copyInputBuffers(input);
+    invoke();
+    return copyOutputBuffers();
+  });
 }
 
 std::shared_ptr<Promise<std::vector<std::shared_ptr<ArrayBuffer>>>>
 HybridTfliteModel::run(const std::vector<std::shared_ptr<ArrayBuffer>>& input) {
-  // Copy input buffers on caller (JS) thread first — input ArrayBuffers are
-  // non-owning JS buffers that may be GC'd if we access them async.
-  copyInputBuffers(input);
+  // Copy input on the worker before returning — JS-owned ArrayBuffers cannot
+  // safely outlive this call because the Promise's async continuation runs
+  // on a different thread and the input may be GC'd. worker::run blocks
+  // briefly while the (cheap, memcpy-based) copy completes.
+  worker::run([this, &input]() { copyInputBuffers(input); });
+
   std::shared_ptr<HybridTfliteModel> sharedThis = shared_cast<HybridTfliteModel>();
   return Promise<std::vector<std::shared_ptr<ArrayBuffer>>>::async(
       [sharedThis]() -> std::vector<std::shared_ptr<ArrayBuffer>> {
-        sharedThis->invoke();
-        return sharedThis->copyOutputBuffers();
+        return worker::run([sharedThis]() -> std::vector<std::shared_ptr<ArrayBuffer>> {
+          sharedThis->invoke();
+          return sharedThis->copyOutputBuffers();
+        });
       });
 }
 
